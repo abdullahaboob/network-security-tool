@@ -1,0 +1,232 @@
+"""
+Steganography Utility Module - Phase 3
+Course: 605346 - Information & Network Security Programming
+Student: Abdallah Haboob | ID: 202310365
+Instructor: Dr. Mohammad Arafah
+
+Features:
+  - LSB steganography: hide text inside PNG image
+  - Extract hidden text from stego image
+  - Optional AES-GCM encryption of hidden payload
+  - Detection discussion
+"""
+
+import sys
+import os
+from PIL import Image
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+
+
+# ============================================================
+# AES-GCM helpers (same pattern as secure_scanner)
+# ============================================================
+
+def _aes_encrypt_bytes(data: bytes, key: bytes) -> bytes:
+    """Encrypt bytes with AES-GCM. Returns nonce(16)+tag(16)+ciphertext."""
+    nonce = get_random_bytes(16)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(data)
+    return nonce + tag + ciphertext
+
+def _aes_decrypt_bytes(data: bytes, key: bytes) -> bytes:
+    """Decrypt AES-GCM blob produced by _aes_encrypt_bytes."""
+    nonce      = data[:16]
+    tag        = data[16:32]
+    ciphertext = data[32:]
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    return cipher.decrypt_and_verify(ciphertext, tag)
+
+
+# ============================================================
+# LSB Steganography Core
+# ============================================================
+
+DELIMITER = b"##STEG_END##"   # marks end of hidden payload
+
+def _bits_from_bytes(data: bytes):
+    """Yield each bit (0 or 1) of a bytes object, MSB first."""
+    for byte in data:
+        for i in range(7, -1, -1):
+            yield (byte >> i) & 1
+
+def _bytes_from_bits(bits):
+    """Reconstruct bytes from an iterable of bits."""
+    result = bytearray()
+    for i in range(0, len(bits), 8):
+        byte = 0
+        for b in bits[i:i + 8]:
+            byte = (byte << 1) | b
+        result.append(byte)
+    return bytes(result)
+
+
+def hide_text(image_path: str, secret_text: str, output_path: str,
+              encrypt: bool = False, key: bytes = None):
+    """
+    Hide secret_text inside image using 1-bit LSB steganography.
+    """
+    img = Image.open(image_path).convert("RGB")
+    pixels = list(img.getdata())
+
+    payload = secret_text.encode("utf-8")
+    if encrypt:
+        if key is None or len(key) != 32:
+            raise ValueError("AES key must be exactly 32 bytes.")
+        payload = _aes_encrypt_bytes(payload, key)
+        print(f"  [STEG] Payload encrypted ({len(payload)} bytes after encryption)")
+
+    payload += DELIMITER   # append end marker
+    bits = list(_bits_from_bytes(payload))
+
+    # capacity check
+    capacity_bits = len(pixels) * 3   # 1 bit per channel
+    if len(bits) > capacity_bits:
+        raise ValueError(
+            f"Image too small! Need {len(bits)} bits, have {capacity_bits}.")
+
+    # embed bits into LSB of each channel
+    new_pixels = []
+    bit_idx = 0
+    for r, g, b in pixels:
+        if bit_idx < len(bits):
+            r = (r & ~1) | bits[bit_idx];     bit_idx += 1
+        if bit_idx < len(bits):
+            g = (g & ~1) | bits[bit_idx];     bit_idx += 1
+        if bit_idx < len(bits):
+            b = (b & ~1) | bits[bit_idx];     bit_idx += 1
+        new_pixels.append((r, g, b))
+
+    stego = Image.new("RGB", img.size)
+    stego.putdata(new_pixels)
+    stego.save(output_path, format="PNG")
+    print(f"  [STEG] Hidden {len(secret_text)} chars in '{output_path}'")
+    print(f"  [STEG] Capacity used: {len(bits)}/{capacity_bits} bits "
+          f"({100*len(bits)/capacity_bits:.2f}%)")
+
+
+def extract_text(stego_path: str, decrypt: bool = False,
+                 key: bytes = None) -> str:
+    """
+    Extract hidden text from stego image.
+    """
+    img = Image.open(stego_path).convert("RGB")
+    pixels = list(img.getdata())
+
+    bits = []
+    for r, g, b in pixels:
+        bits.extend([r & 1, g & 1, b & 1])
+
+    raw = _bytes_from_bits(bits)
+
+    # find delimiter
+    idx = raw.find(DELIMITER)
+    if idx == -1:
+        raise ValueError("No hidden payload found (delimiter not detected).")
+
+    payload = raw[:idx]
+
+    if decrypt:
+        if key is None or len(key) != 32:
+            raise ValueError("AES key must be exactly 32 bytes.")
+        payload = _aes_decrypt_bytes(payload, key)
+        print("  [STEG] Payload decrypted successfully.")
+
+    return payload.decode("utf-8")
+
+
+# ============================================================
+# Detection Discussion (printed to console)
+# ============================================================
+
+DETECTION_DISCUSSION = """
+╔══════════════════════════════════════════════════════════════╗
+║          Steganography Detection Discussion                  ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  1. Statistical Analysis (Chi-Square Test)                   ║
+║     LSB embedding disturbs the natural pixel-value           ║
+║     distribution. A chi-square test on pixel LSBs detects    ║
+║     unusual uniformity in the least-significant bits.        ║
+║     Tool: StegDetect, StegoVeritas                           ║
+║                                                              ║
+║  2. Visual Attack                                            ║
+║     Amplifying the LSB plane (multiplying pixel values       ║
+║     by 255) can reveal hidden data as visible noise.         ║
+║     Tool: StegSolve, Steganalysis toolkits                   ║
+║                                                              ║
+║  3. File Size / Metadata Analysis                            ║
+║     Stego images often have identical size to originals.     ║
+║     ExifTool can reveal metadata inconsistencies.             ║
+║                                                              ║
+║  4. RS (Regular-Singular) Analysis                           ║
+║     Advanced statistical attack that identifies LSB          ║
+║     embedding even at low capacity usage.                    ║
+║                                                              ║
+║  Mitigation:                                                 ║
+║  - Encrypt payload before embedding (done in this tool)      ║
+║  - Use small payload relative to image size                  ║
+║  - Use JPEG compression to mask statistical anomalies        ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+
+# ============================================================
+# Demo (تم تعديل المسارات لتتوافق مع نظام Windows تلقائياً)
+# ============================================================
+
+def create_test_image(path: str, size: int = 300):
+    """Create a simple cover image for testing."""
+    import random
+    img = Image.new("RGB", (size, size))
+    pixels = [(random.randint(0, 255),
+               random.randint(0, 255),
+               random.randint(0, 255)) for _ in range(size * size)]
+    img.putdata(pixels)
+    img.save(path, format="PNG")
+    print(f"  [STEG] Test image created: {path} ({size}x{size} px)")
+
+
+def demo():
+    print("=" * 55)
+    print("  Phase 3 — Steganography Module Demo")
+    print("  Student: Abdallah Haboob | ID: 202310365")
+    print("=" * 55)
+
+    # التعديل البرمجي لبيئة الويندوز (أصبحت المسارات محلية في نفس مجلد التشغيل الحالي)
+    cover   = "cover.png"
+    stego   = "stego.png"
+    stego_e = "stego_encrypted.png"
+    secret  = "Phase 3 secret message — Abdallah Haboob 202310365"
+    aes_key = b"Phase3AESKey1234Phase3AESKey1234"  # 32 bytes
+
+    create_test_image(cover)
+
+    # --- Plain LSB ---
+    print("\n[1] Hiding text (no encryption):")
+    hide_text(cover, secret, stego, encrypt=False)
+
+    print("\n[2] Extracting text (no encryption):")
+    extracted = extract_text(stego, decrypt=False)
+    print(f"  [STEG] Extracted: '{extracted}'")
+    assert extracted == secret, "Extraction failed!"
+    print("  [STEG] ✓ Match confirmed.")
+
+    # --- Encrypted LSB ---
+    print("\n[3] Hiding text (AES-GCM encrypted):")
+    hide_text(cover, secret, stego_e, encrypt=True, key=aes_key)
+
+    print("\n[4] Extracting text (AES-GCM decrypted):")
+    extracted_e = extract_text(stego_e, decrypt=True, key=aes_key)
+    print(f"  [STEG] Extracted: '{extracted_e}'")
+    assert extracted_e == secret, "Encrypted extraction failed!"
+    print("  [STEG] ✓ Match confirmed.")
+
+    # --- Detection Discussion ---
+    print(DETECTION_DISCUSSION)
+    print("[*] Demo complete.")
+
+
+if __name__ == "__main__":
+    demo()
