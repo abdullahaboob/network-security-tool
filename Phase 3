@@ -1,0 +1,294 @@
+"""
+Network Security Toolkit - Phase 3
+Course: 605346 - Information & Network Security Programming
+Student: Abdallah Haboob | ID: 202310365
+Instructor: Dr. Mohammad Arafah
+Academic Year: 2025 - 2026, Semester 2
+
+Phase 3 adds:
+  - AES-GCM encrypted client-server communication (PyCryptodome)
+  - HMAC-SHA256 integrity verification
+  - Integrated with Phase 1 port scanner
+"""
+
+import socket
+import threading
+import json
+import hmac
+import hashlib
+import os
+import argparse
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+
+# ============================================================
+# Shared Secret Key (32 bytes = AES-256)
+# In production: exchange via Diffie-Hellman or PKI
+# ============================================================
+SHARED_KEY = b"Phase3SecureKey!Phase3SecureKey!"   # 32 bytes
+HMAC_KEY   = b"Phase3HMACKey!!!Phase3HMACKey!!!"   # 32 bytes
+
+# ============================================================
+# AES-GCM Encryption / Decryption Helpers
+# ============================================================
+
+def aes_encrypt(plaintext: str, key: bytes) -> dict:
+    """
+    Encrypt plaintext using AES-GCM.
+    Returns dict with nonce, ciphertext, tag (all hex-encoded).
+    """
+    nonce = get_random_bytes(16)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext.encode("utf-8"))
+    return {
+        "nonce": nonce.hex(),
+        "ciphertext": ciphertext.hex(),
+        "tag": tag.hex()
+    }
+
+def aes_decrypt(payload: dict, key: bytes) -> str:
+    """
+    Decrypt AES-GCM payload dict.
+    Raises ValueError if authentication tag is invalid.
+    """
+    nonce      = bytes.fromhex(payload["nonce"])
+    ciphertext = bytes.fromhex(payload["ciphertext"])
+    tag        = bytes.fromhex(payload["tag"])
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+    return plaintext.decode("utf-8")
+
+# ============================================================
+# HMAC Integrity Verification
+# ============================================================
+
+def compute_hmac(data: str, key: bytes) -> str:
+    return hmac.new(key, data.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def verify_hmac(data: str, received_mac: str, key: bytes) -> bool:
+    expected = compute_hmac(data, key)
+    return hmac.compare_digest(expected, received_mac)
+
+# ============================================================
+# Secure Message Framing
+# ============================================================
+
+def build_secure_message(plaintext: str) -> bytes:
+    """Encrypt + MAC then JSON-encode for transmission."""
+    encrypted = aes_encrypt(plaintext, SHARED_KEY)
+    mac = compute_hmac(json.dumps(encrypted, sort_keys=True), HMAC_KEY)
+    packet = {"encrypted": encrypted, "mac": mac}
+    return json.dumps(packet).encode("utf-8")
+
+def parse_secure_message(raw: bytes) -> str:
+    """Verify MAC then decrypt incoming message."""
+    packet = json.loads(raw.decode("utf-8"))
+    encrypted_str = json.dumps(packet["encrypted"], sort_keys=True)
+    if not verify_hmac(encrypted_str, packet["mac"], HMAC_KEY):
+        raise ValueError("[!] HMAC verification failed — message tampered!")
+    return aes_decrypt(packet["encrypted"], SHARED_KEY)
+
+# ============================================================
+# Phase 1 Port Scanner (integrated)
+# ============================================================
+
+file_lock  = threading.Lock()
+print_lock = threading.Lock()
+
+def log_result(log_file: str, message: str):
+    with file_lock:
+        with open(log_file, "a") as f:
+            f.write(message + "\n")
+
+def print_result(message: str):
+    with print_lock:
+        print(message)
+
+def scan_port(target: str, port: int, log_file: str, timeout: float = 1.0):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((target, port))
+        sock.close()
+        tid = threading.current_thread().name
+        if result == 0:
+            msg = f"[{datetime.now().strftime('%H:%M:%S')}] [{tid}] {target}:{port} --> OPEN"
+            print_result(f"\033[92m{msg}\033[0m")
+        else:
+            msg = f"[{datetime.now().strftime('%H:%M:%S')}] [{tid}] {target}:{port} --> CLOSED"
+            print_result(f"\033[91m{msg}\033[0m")
+        log_result(log_file, msg)
+    except Exception as e:
+        err = f"[ERROR] {target}:{port} - {e}"
+        print_result(err)
+        log_result(log_file, err)
+
+def run_scan(targets, ports, log_file, threads=100, timeout=1.0):
+    print_result(f"\n[SCANNER] Scanning {len(targets)} target(s), {len(ports)} port(s)")
+    log_result(log_file, "=" * 60)
+    log_result(log_file, f"Scan started: {datetime.now()}")
+    with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="Scanner") as ex:
+        for target in targets:
+            for port in ports:
+                ex.submit(scan_port, target, port, log_file, timeout)
+    log_result(log_file, f"Scan completed: {datetime.now()}")
+    log_result(log_file, "=" * 60)
+    print_result(f"[SCANNER] Done. Results → {log_file}")
+
+# ============================================================
+# Secure SERVER
+# ============================================================
+
+def handle_client(conn, addr):
+    """Handle one secure client connection."""
+    print(f"\n[SERVER] Connection from {addr}")
+    try:
+        # 1. Receive scan request (encrypted)
+        raw = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+            if raw.endswith(b"##END##"):
+                raw = raw[:-7]
+                break
+
+        request_text = parse_secure_message(raw)
+        print(f"[SERVER] Decrypted request: {request_text}")
+
+        request = json.loads(request_text)
+        target  = request.get("target", "127.0.0.1")
+        ports   = request.get("ports", list(range(1, 1025)))
+
+        # 2. Run scan
+        log_file = f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        run_scan([target], ports, log_file)
+
+        # 3. Read results
+        with open(log_file) as f:
+            results = f.read()
+
+        # 4. Send encrypted results back
+        response_msg = json.dumps({"status": "ok", "results": results})
+        conn.sendall(build_secure_message(response_msg) + b"##END##")
+        print("[SERVER] Encrypted results sent.")
+
+    except ValueError as e:
+        print(f"[SERVER] Security error: {e}")
+        error_msg = json.dumps({"status": "error", "message": str(e)})
+        conn.sendall(build_secure_message(error_msg) + b"##END##")
+    except Exception as e:
+        print(f"[SERVER] Error: {e}")
+    finally:
+        conn.close()
+
+def run_server(host="127.0.0.1", port=9999):
+    """Start the secure scan server."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    srv.listen(5)
+    print(f"\n[SERVER] Listening on {host}:{port} (AES-GCM + HMAC)")
+    print(f"[SERVER] Key: {'*' * 20} (shared secret)")
+    while True:
+        conn, addr = srv.accept()
+        t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+        t.start()
+
+# ============================================================
+# Secure CLIENT
+# ============================================================
+
+def run_client(server_host="127.0.0.1", server_port=9999,
+               target="127.0.0.1", ports=None):
+    """Send an encrypted scan request to the server."""
+    if ports is None:
+        ports = list(range(1, 101))
+
+    request = json.dumps({"target": target, "ports": ports})
+
+    print(f"\n[CLIENT] Connecting to {server_host}:{server_port}")
+    print(f"[CLIENT] Requesting scan of {target} on {len(ports)} ports")
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((server_host, server_port))
+
+    # Send encrypted request
+    s.sendall(build_secure_message(request) + b"##END##")
+    print("[CLIENT] Encrypted request sent.")
+
+    # Receive encrypted response
+    raw = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        raw += chunk
+        if raw.endswith(b"##END##"):
+            raw = raw[:-7]
+            break
+    s.close()
+
+    response_text = parse_secure_message(raw)
+    response = json.loads(response_text)
+
+    if response["status"] == "ok":
+        print("\n[CLIENT] ✓ Scan results received and verified:")
+        print(response["results"][:2000])
+    else:
+        print(f"[CLIENT] ✗ Error: {response['message']}")
+
+# ============================================================
+# Demo: run server + client on localhost
+# ============================================================
+
+def demo():
+    """Quick demo: server in background thread, client in main thread."""
+    print("=" * 55)
+    print("  Phase 3 — Secure Scanner Demo (AES-GCM + HMAC)")
+    print("  Student: Abdallah Haboob | ID: 202310365")
+    print("=" * 55)
+
+    # Start server in background
+    srv_thread = threading.Thread(
+        target=run_server, args=("127.0.0.1", 9999), daemon=True)
+    srv_thread.start()
+
+    import time; time.sleep(0.5)   # wait for server to bind
+
+    # Client sends scan request
+    run_client(
+        server_host="127.0.0.1",
+        server_port=9999,
+        target="127.0.0.1",
+        ports=list(range(1, 200))
+    )
+
+    print("\n[*] Demo complete.")
+
+# ============================================================
+# CLI
+# ============================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Phase 3 Secure Scanner")
+    parser.add_argument("--mode", choices=["server", "client", "demo"],
+                        default="demo")
+    parser.add_argument("--host",   default="127.0.0.1")
+    parser.add_argument("--port",   type=int, default=9999)
+    parser.add_argument("--target", default="127.0.0.1")
+    parser.add_argument("--ports",  default="1-100")
+    args = parser.parse_args()
+
+    if args.mode == "demo":
+        demo()
+    elif args.mode == "server":
+        run_server(args.host, args.port)
+    elif args.mode == "client":
+        parts = args.ports.split("-")
+        ports = list(range(int(parts[0]), int(parts[1]) + 1)) if "-" in args.ports \
+                else [int(p) for p in args.ports.split(",")]
+        run_client(args.host, args.port, args.target, ports)
